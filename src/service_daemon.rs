@@ -3855,7 +3855,21 @@ impl Zeroconf {
             let qtype = question.entry_type();
             let q_name = question.entry_name();
 
-            if qtype == RRType::PTR {
+            // An ANY question for one of our service types asks for every
+            // record of that name, which includes the PTR records pointing to
+            // our instances (RFC 1035 §3.2.3, RFC 6762 §6). Answer it like a
+            // PTR question. Some browsers only ask ANY: VRChat's OSCQuery
+            // client, for one, browses "_oscjson._tcp.local." ANY and never
+            // asks PTR. Probe questions (with records in the Authority
+            // Section) keep the tiebreaking path below.
+            let any_for_my_service_type = qtype == RRType::ANY
+                && msg.num_authorities() == 0
+                && self
+                    .my_services
+                    .values()
+                    .any(|service| service.matches_type_or_subtype(q_name));
+
+            if qtype == RRType::PTR || any_for_my_service_type {
                 // PTR answers are shared records: defer the response unless this
                 // is a legacy-unicast (source port differs from ours) or probe-defense
                 // (records in the Authority Section) query.
@@ -6595,6 +6609,127 @@ mod tests {
         assert!(response.questions().is_empty());
         assert_eq!(response.answers()[0].get_record().get_ttl(), 120);
         assert!(response.answers()[0].get_record().is_unique());
+    }
+
+    #[test]
+    fn test_any_question_for_service_type_gets_ptr_answer() {
+        // An ANY question for a service type must be answered like a PTR
+        // question: the PTR to our instance in the Answer Section, and its
+        // SRV, TXT and address records in the Additional Section (RFC 6763
+        // §12.1). VRChat's OSCQuery client browses this way and never asks
+        // PTR.
+        //
+        // The query is sent from an ephemeral port so the response comes back
+        // as a legacy unicast (see `test_legacy_unicast_response`), which
+        // lets this un-joined socket receive it.
+
+        let intf_ip = match my_ip_interfaces(false)
+            .into_iter()
+            .find_map(|intf| match intf.ip() {
+                IpAddr::V4(ip) => Some(ip),
+                IpAddr::V6(_) => None,
+            }) {
+            Some(ip) => ip,
+            None => {
+                println!("No IPv4 interface available; skipping test.");
+                return;
+            }
+        };
+
+        let daemon = ServiceDaemon::new().expect("Failed to create daemon");
+        let unique = SystemTime::now()
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .unwrap()
+            .as_micros();
+        let service_type = "_any-question._udp.local.";
+        let instance = format!("any-question-{unique}");
+        let fullname = format!("{instance}.{service_type}");
+        let hostname = format!("any-question-{unique}.local.");
+        let service_info = ServiceInfo::new(
+            service_type,
+            &instance,
+            &hostname,
+            &[IpAddr::V4(intf_ip)] as &[IpAddr],
+            5200,
+            None,
+        )
+        .expect("invalid service info");
+        daemon.register(service_info).expect("register service");
+
+        let querier = UdpSocket::bind((intf_ip, 0)).expect("bind querier socket");
+        querier
+            .set_multicast_loop_v4(true)
+            .expect("enable multicast loopback");
+        querier
+            .set_read_timeout(Some(Duration::from_millis(500)))
+            .expect("set read timeout");
+
+        let mut query = DnsOutgoing::new(FLAGS_QR_QUERY);
+        query.add_question(service_type, RRType::ANY);
+        let query_packet = query
+            .to_data_on_wire(MAX_PKT_DEFAULT, true)
+            .pop()
+            .expect("query serialized to one packet");
+
+        let if_id = InterfaceId {
+            name: "test".to_string(),
+            index: 0,
+        };
+
+        // The service is announced asynchronously after register(), so retry
+        // the query until our answer comes back or the deadline passes.
+        let deadline = Instant::now() + Duration::from_secs(8);
+        let mut response = None;
+        'outer: while Instant::now() < deadline {
+            querier
+                .send_to(&query_packet, (GROUP_ADDR_V4, MDNS_PORT))
+                .expect("send query");
+            let mut buf = [0u8; 1500];
+            while let Ok((len, _from)) = querier.recv_from(&mut buf) {
+                let Ok(msg) = DnsIncoming::new(buf[..len].to_vec(), if_id.clone()) else {
+                    continue;
+                };
+                if msg.is_response()
+                    && msg
+                        .additionals()
+                        .iter()
+                        .any(|a| a.get_name().eq_ignore_ascii_case(&fullname))
+                {
+                    response = Some(msg);
+                    break 'outer;
+                }
+            }
+        }
+        let msg = response.expect("expected an answer to the ANY question for the service type");
+
+        // The PTR is the answer...
+        let ptr = msg
+            .answers()
+            .iter()
+            .find(|a| a.get_type() == RRType::PTR)
+            .expect("the answer section has a PTR record");
+        assert!(ptr.get_name().eq_ignore_ascii_case(service_type));
+        let ptr = ptr
+            .any()
+            .downcast_ref::<DnsPointer>()
+            .expect("PTR record is a DnsPointer");
+        assert!(ptr.alias().eq_ignore_ascii_case(&fullname));
+        assert!(
+            msg.answers().iter().all(|a| a.get_type() == RRType::PTR),
+            "only the PTR belongs in the answer section"
+        );
+
+        // ...and SRV, TXT and the address are additional records.
+        let additional = |rr_type: RRType, name: &str| {
+            msg.additionals()
+                .iter()
+                .any(|a| a.get_type() == rr_type && a.get_name().eq_ignore_ascii_case(name))
+        };
+        assert!(additional(RRType::SRV, &fullname), "SRV in additionals");
+        assert!(additional(RRType::TXT, &fullname), "TXT in additionals");
+        assert!(additional(RRType::A, &hostname), "A in additionals");
+
+        daemon.shutdown().unwrap();
     }
 
     #[test]
